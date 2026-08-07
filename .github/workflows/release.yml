@@ -1,0 +1,148 @@
+name: CZDS NRD Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+  schedule:
+    # CZDS zone files finish updating by 06:00 UTC — run at 07:00 UTC daily
+    - cron: '0 7 * * *'
+    # Backup run in case GitHub skips the 07:00 scheduled trigger
+    - cron: '0 9 * * *'
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check if today's release already exists
+        id: check-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          if gh release view "v${DATE}" -R ${{ github.repository }} &>/dev/null; then
+            echo "Release v${DATE} already exists — skipping run."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "No release for v${DATE} yet — proceeding."
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Free disk space
+        if: steps.check-release.outputs.skip != 'true'
+        run: |
+          sudo rm -rf /opt/hostedtoolcache /usr/local/lib/android /usr/share/dotnet
+          df -h
+
+      - name: Checkout
+        if: steps.check-release.outputs.skip != 'true'
+        uses: actions/checkout@v4
+
+      - name: Prepare binary
+        if: steps.check-release.outputs.skip != 'true'
+        run: |
+          cp bin/czds-nrd czds-nrd
+          chmod +x czds-nrd
+
+      - name: Phase 1 — Download & extract zones
+        if: steps.check-release.outputs.skip != 'true'
+        env:
+          CZDS_USERNAME: ${{ secrets.CZDS_USERNAME }}
+          CZDS_PASSWORD: ${{ secrets.CZDS_PASSWORD }}
+        run: ./czds-nrd download
+
+      - name: Phase 2 — Clean & deduplicate
+        if: steps.check-release.outputs.skip != 'true'
+        run: ./czds-nrd clean
+
+      - name: Phase 3 — Diff against recent releases up to 500 MB baseline
+        if: steps.check-release.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TODAY_TXT=$(ls domains-*.txt | head -1)
+
+          # Crawl releases newest→oldest; collect all small NRD diff releases
+          # (typically 8–10 MB each) and stop as soon as a single release zip
+          # is >= 500 MB (a full zone-list baseline). That large release is
+          # included then crawl halts. All collected zips are passed as baselines
+          # — a domain is "new" only if absent from every one of them.
+          # Naming handled for both conventions:
+          #   - new releases: DATE.zip
+          #   - legacy releases: nrd-DATE.zip (+ possibly nrd-DATE-partK.zip)
+          # We always pick the single total zip per release (never a -partK).
+          LIMIT_BYTES=$(( 500 * 1024 * 1024 ))
+          PREV_ZIPS=""
+
+          mapfile -t PREV_TAGS < <(gh release list -R ${{ github.repository }} --limit 60 --json tagName -q '.[].tagName')
+          i=0
+          for TAG in "${PREV_TAGS[@]}"; do
+            [ -z "$TAG" ] && continue
+            dir="prev$i"; i=$(( i + 1 ))
+            mkdir -p "$dir"
+            if gh release download "$TAG" -R ${{ github.repository }} --pattern "*.zip" -D "$dir" 2>/dev/null; then
+              ZIP=$(ls "$dir"/*.zip 2>/dev/null | grep -v -- '-part[0-9]*\.zip$' | head -1)
+              if [ -n "$ZIP" ]; then
+                SIZE=$(stat -c%s "$ZIP")
+                echo "Baseline $TAG -> $(basename "$ZIP") ($((SIZE/1024/1024)) MB)"
+                PREV_ZIPS="$PREV_ZIPS $ZIP"
+                if [ "$SIZE" -ge "$LIMIT_BYTES" ]; then
+                  echo "Found large release (>= 500 MB) — stopping crawl."
+                  break
+                fi
+              fi
+            fi
+          done
+
+          if [ -n "$PREV_ZIPS" ]; then
+            echo "Computing NRD diff against $i release(s):$PREV_ZIPS"
+            ./czds-nrd diff "$TODAY_TXT" $PREV_ZIPS | tee diff.log
+            grep '^ASSET:' diff.log | sed 's/^ASSET://' > assets.txt
+          else
+            echo "No previous release found — first run, releasing full list as NRD baseline"
+            ./czds-nrd release | tee release.log
+            grep '^ASSET:' release.log | sed 's/^ASSET://' > assets.txt
+          fi
+
+          echo "Assets to upload:"
+          cat assets.txt
+
+      - name: Phase 4 — Create GitHub Release
+        if: steps.check-release.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          TAG="v${DATE}"
+          ASSETS=$(cat assets.txt | tr '\n' ' ')
+
+          # For scheduled runs, create a dated tag
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            git config user.email "nrd-bot@github.com"
+            git config user.name "NRD Bot"
+            git tag "$TAG" || true
+            git push origin "$TAG" || true
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+
+          gh release create "$TAG" \
+            --title "NRD $DATE" \
+            --notes "Newly registered domains from CZDS zone files. Generated $DATE at 07:00 UTC." \
+            $ASSETS
+
+      - name: Phase 5 — Send full NRD zip to Telegram
+        if: steps.check-release.outputs.skip != 'true'
+        env:
+          TELEGRAM_API_BASE: ${{ secrets.TELEGRAM_API_BASE }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          # Send every zip produced this run (normally a single DATE.zip).
+          ASSETS=$(cat assets.txt | tr '\n' ' ')
+          echo "Sending to Telegram: $ASSETS"
+          ./czds-nrd telegram $ASSETS
