@@ -1,0 +1,10 @@
+.env
+CLAUDE.md
+*.zip
+*.txt
+zones_temp/
+domains_temp/
+dom/
+*.gz
+/czds-nrd
+/NRD
