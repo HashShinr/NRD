@@ -1,4 +1,5 @@
 name: CZDS NRD Release
+# workflow_dispatch trigger for manual runs
 
 on:
   push:
