@@ -19,17 +19,26 @@ jobs:
       contents: write
 
     steps:
-      - name: Check if today's release already exists
+      - name: Determine target tag & check if release already exists
         id: check-release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           DATE=$(date -u +%Y-%m-%d)
-          if gh release view "v${DATE}" -R ${{ github.repository }} &>/dev/null; then
-            echo "Release v${DATE} already exists — skipping run."
+          # push (tag) uses the pushed tag; schedule & manual runs use a dated tag.
+          # Manual (workflow_dispatch) runs on master must NOT use the branch name
+          # as the release tag — that collides with a "master" release on re-runs.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="v${DATE}"
+          fi
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          if gh release view "${TAG}" -R ${{ github.repository }} &>/dev/null; then
+            echo "Release ${TAG} already exists — skipping run."
             echo "skip=true" >> $GITHUB_OUTPUT
           else
-            echo "No release for v${DATE} yet — proceeding."
+            echo "No release for ${TAG} yet — proceeding."
             echo "skip=false" >> $GITHUB_OUTPUT
           fi
 
@@ -118,17 +127,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           DATE=$(date -u +%Y-%m-%d)
-          TAG="v${DATE}"
+          TAG="${{ steps.check-release.outputs.tag }}"
           ASSETS=$(cat assets.txt | tr '\n' ' ')
 
-          # For scheduled runs, create a dated tag
-          if [ "${{ github.event_name }}" = "schedule" ]; then
+          # For schedule & manual runs, ensure the dated tag exists (pushed tags
+          # already exist by definition).
+          if [ "${{ github.event_name }}" != "push" ]; then
             git config user.email "nrd-bot@github.com"
             git config user.name "NRD Bot"
             git tag "$TAG" || true
             git push origin "$TAG" || true
-          else
-            TAG="${{ github.ref_name }}"
           fi
 
           gh release create "$TAG" \
