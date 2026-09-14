@@ -8,3 +8,9 @@ dom/
 *.gz
 /czds-nrd
 /NRD
+
+# Go source stays local — only the prebuilt binary is published
+/*.go
+/go.mod
+/go.sum
+/AGENTS.md
